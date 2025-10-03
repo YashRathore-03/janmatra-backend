@@ -2,8 +2,9 @@ import io
 import base64
 import os
 import requests
+import json
 from typing import List, Optional, Any, Dict
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI, HTTPException, Body, Request
 from pydantic import BaseModel
 import torch
 from transformers import XLMRobertaTokenizerFast, XLMRobertaForSequenceClassification, pipeline
@@ -15,21 +16,28 @@ from bson import ObjectId
 from google.cloud import storage
 from contextlib import asynccontextmanager
 from fastapi.middleware import cors
+from openai import OpenAI
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Environment setup
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.join(os.path.dirname(__file__), "sacred-truck-473222-n2-30bd10f14101.json")
 
 # Configuration
 GCS_BUCKET = "janmatra-storage-bucket"
-MONGO_URL = "mongodb+srv://anshvahini16:Curet24.Nelll@volume-logs.iwoipqu.mongodb.net/?retryWrites=true&w=majority&appName=volume-logs"
-SENTIMENT_MODEL_PATH = "xlm-roberta-zero-shot"
-TOKENIZER_PATH = "xlm-roberta-base"
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyDBRkT19u526TWs1w2_s4rE1-DgTu5fLbg")
+MONGO_URL = os.getenv("MONGO_URL", "")
+SENTIMENT_MODEL_PATH = "./models/xlm-roberta-zero-shot"
+TOKENIZER_PATH = "./models/xlm-roberta-base"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GEMINI_CHAT_KEY = os.getenv("GEMINI_CHAT_KEY", "")
 
 # Global variables - EXACTLY as original
 tokenizer = None
 sentiment_model = None
 gemini_model = None
+groq_model = None
 fallback_pipeline = None
 mongo_client = None
 db = None
@@ -50,15 +58,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+class ChatbotRequest(BaseModel):
+    prompt: str
+
 # Pydantic models
 class CommentRequest(BaseModel):
     comments: List[str]
     use_gemini_summary: Optional[bool] = True
-    max_summary_length: Optional[int] = 1500
-    min_summary_length: Optional[int] = 1000
+    max_summary_length: Optional[int] = 500
+    min_summary_length: Optional[int] = 300
 
 class ExternalDatabaseConfig(BaseModel):
-    """Configuration for connecting to external user databases"""
     database_type: str  # "mongodb", "mysql", "postgresql", "api"
     connection_string: Optional[str] = None
     api_endpoint: Optional[str] = None
@@ -66,27 +76,24 @@ class ExternalDatabaseConfig(BaseModel):
     query_params: Optional[Dict[str, str]] = {}
 
 class ImportExternalDataRequest(BaseModel):
-    """Import data from external user databases"""
     database_config: ExternalDatabaseConfig
     query: Optional[str] = None  # SQL query or collection name
     use_gemini_summary: Optional[bool] = True
-    max_summary_length: Optional[int] = 1500
-    min_summary_length: Optional[int] = 1000
+    max_summary_length: Optional[int] = 500
+    min_summary_length: Optional[int] = 300
 
-# ORIGINAL analyze-extension function - PRESERVED EXACTLY
 @app.post("/analyze-extension")
 async def analyze_extension_data(extension_data: List[Any]):
     global SOURCE_TITLE
-    
+    print(extension_data)
     print(f"Received extension data: {len(extension_data)} items")
     
     if not extension_data:
         raise HTTPException(status_code=400, detail="No comments provided")
     
-    SOURCE_TITLE = extension_data[0].get('source_title', 'Unknown Source')
+    SOURCE_TITLE = extension_data[0].get('metadata', '').get('title', 'Unknown Source')
     comment_texts = []
     for i, item in enumerate(extension_data):
-        print(f"Item {i}: {type(item)} - {item.keys() if isinstance(item, dict) else 'Not a dict'}")
         if isinstance(item, dict) and 'text' in item:
             text = item['text']
             if text and text.strip():
@@ -101,7 +108,6 @@ async def analyze_extension_data(extension_data: List[Any]):
     request = CommentRequest(comments=comment_texts)
     return await analyze_comments(request)
 
-# ORIGINAL download_from_gcs function - PRESERVED EXACTLY
 def download_from_gcs(gcs_path: str, local_dir: str = "./models/"):
     print(f"📥 Downloading files from GCS: {gcs_path}")
     storage_client = storage.Client()
@@ -124,9 +130,8 @@ def download_from_gcs(gcs_path: str, local_dir: str = "./models/"):
         blob.download_to_filename(local_path)
         print(f"✅ Downloaded: {blob.name} -> {local_path}")
 
-# ORIGINAL load_models function - PRESERVED EXACTLY
 def load_models():
-    global tokenizer, sentiment_model, gemini_model, fallback_pipeline
+    global tokenizer, sentiment_model, gemini_model, fallback_pipeline, groq_model
 
     try:
         print("Attempting to load custom sentiment analysis model...")
@@ -145,84 +150,68 @@ def load_models():
         genai.configure(api_key=GEMINI_API_KEY)
         gemini_model = genai.GenerativeModel('gemini-2.0-flash-exp')
         print("Gemini API configured!")
+        groq_model = OpenAI(
+            base_url="https://api.groq.com/openai/v1",
+            api_key=GROQ_API_KEY
+        )
+        print("Groq API configured!")
 
         print("All models loaded successfully!")
 
     except Exception as e:
         print(f"Error loading models: {e}")
 
-# ORIGINAL predict_sentiment function - PRESERVED EXACTLY
 def predict_sentiment(comment: str) -> dict:
-    global tokenizer, sentiment_model, fallback_pipeline
-    
+    global groq_model, SENTIMENT_LABELS
+
     try:
-        # Try custom model first
-        if tokenizer and sentiment_model:
-            inputs = tokenizer(
-                comment, 
-                return_tensors="pt", 
-                padding=True, 
-                truncation=True, 
-                max_length=128
+        if groq_model:
+            prompt = f"""Analyze the sentiment of the following comment and classify it into one of these categories: Positive, Negative, Neutral, or Suggestive.
+            Comment: "{comment}"
+
+            Respond ONLY with a JSON object in this exact format (no additional text):
+            {{
+                "sentiment": "Positive|Negative|Neutral|Suggestive",
+                "confidence": 0.0-1.0,
+                "all_probabilities": {{
+                    "Positive": float,
+                    "Negative": float,
+                    "Neutral": float,
+                    "Suggestive": float
+                }}
+            }}"""
+
+            response = groq_model.chat.completions.create(
+                model="openai/gpt-oss-120B",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0
             )
-            
-            with torch.no_grad():
-                outputs = sentiment_model(**inputs)
-                logits = outputs.logits
-                
-                probabilities = torch.nn.functional.softmax(logits, dim=-1)
-                
-                predicted_class_idx = torch.argmax(probabilities, dim=-1).item()
-                predicted_label = SENTIMENT_LABELS[predicted_class_idx]
-                confidence = probabilities[0][predicted_class_idx].item()
+
+            response_text = response.choices[0].message.content.strip()
+
+            if response_text.startswith("```"):
+                response_text = response_text.split("```")[1]
+                if response_text.startswith("json"):
+                    response_text = response_text[4:]
+                response_text = response_text.strip()
+
+            result = json.loads(response_text)
+            sentiment = result.get("sentiment", "Neutral")
+            confidence = float(result.get("confidence", 0.5))
+
+            if sentiment not in SENTIMENT_LABELS:
+                sentiment = "Neutral"
+                confidence = 0.5
+
+            all_probs = {k: float(v) for k, v in result.get("all_probabilities", {}).items()}
             
             return {
-                "sentiment": predicted_label,
+                "sentiment": sentiment,
                 "confidence": round(confidence, 4),
-                "all_probabilities": {
-                    label: round(prob.item(), 4) 
-                    for label, prob in zip(SENTIMENT_LABELS, probabilities[0])
-                }
-            }
-        
-        # Use fallback pipeline
-        elif fallback_pipeline:
-            results = fallback_pipeline(comment)
-            
-            # Map the fallback results to our format
-            sentiment_map = {
-                "LABEL_0": "Negative",
-                "LABEL_1": "Neutral", 
-                "LABEL_2": "Positive",
-                "negative": "Negative",
-                "neutral": "Neutral",
-                "positive": "Positive"
-            }
-            
-            best_result = max(results[0], key=lambda x: x['score'])
-            mapped_sentiment = sentiment_map.get(best_result['label'], best_result['label'])
-            
-            # Create probabilities dict
-            all_probs = {
-                "Positive": 0.0,
-                "Negative": 0.0, 
-                "Neutral": 0.0,
-                "Suggestive": 0.0
-            }
-            
-            for result in results[0]:
-                mapped_label = sentiment_map.get(result['label'], result['label'])
-                if mapped_label in all_probs:
-                    all_probs[mapped_label] = round(result['score'], 4)
-            
-            return {
-                "sentiment": mapped_sentiment,
-                "confidence": round(best_result['score'], 4),
                 "all_probabilities": all_probs
             }
-        
+
         else:
-            # Basic fallback
             return {
                 "sentiment": "Neutral",
                 "confidence": 0.5,
@@ -233,16 +222,21 @@ def predict_sentiment(comment: str) -> dict:
                     "Suggestive": 0.0
                 }
             }
-    
+
     except Exception as e:
         print(f"Error in predict_sentiment: {e}")
         return {
-            "sentiment": "Error",
-            "confidence": 0.0,
+            "sentiment": "Neutral",
+            "confidence": 0.5,
+            "all_probabilities": {
+                "Positive": 0.25,
+                "Negative": 0.25,
+                "Neutral": 0.5,
+                "Suggestive": 0.0
+            },
             "error": str(e)
         }
 
-# ORIGINAL suggestions function - PRESERVED EXACTLY
 @app.post("/suggestions")
 async def generate_suggestions(summary: str = Body(..., embed=True)):
     try:
@@ -481,8 +475,8 @@ async def analyze_comments(payload: CommentRequest):
         
         sentiment_analysis = analyze_sentiment_distribution(sentiment_results)
         
-        return {
-            "Source Title": SOURCE_TITLE,
+        # Prepare response data
+        response_data = {
             "sentiment_analysis": {
                 "individual_results": sentiment_results,
                 "distribution": sentiment_analysis
@@ -503,14 +497,39 @@ async def analyze_comments(payload: CommentRequest):
             }
         }
         
+        if collection is not None and SOURCE_TITLE:
+            try:
+                # Prepare document for MongoDB
+                mongo_document = {
+                    **response_data
+                }
+                
+                # Use update_one with upsert=True to update existing or insert new
+                result = collection.update_one(
+                    {"SourceTitle": SOURCE_TITLE},  # Filter: find document with this Source Title
+                    {"$set": mongo_document},        # Update: set the entire document
+                    upsert=True                      # Upsert: insert if not found
+                )
+                
+                if result.upserted_id:
+                    print(f"✅ Inserted new record for Source Title: {SOURCE_TITLE}")
+                elif result.modified_count > 0:
+                    print(f"✅ Updated existing record for Source Title: {SOURCE_TITLE}")
+                else:
+                    print(f"ℹ️ No changes needed for Source Title: {SOURCE_TITLE}")
+                    
+            except Exception as db_error:
+                print(f"⚠️ MongoDB storage error: {db_error}")
+                # Continue and return response even if DB storage fails
+        
+        return response_data
+        
     except Exception as e:
         print(f"Error in analyze_comments: {e}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
-# NEW ENDPOINT: Import from external database
 @app.post("/import-external")
 async def import_from_external_database(payload: ImportExternalDataRequest):
-    """Import and analyze comments from external user databases"""
     global SOURCE_TITLE
     
     try:
@@ -541,7 +560,6 @@ async def import_from_external_database(payload: ImportExternalDataRequest):
         print(f"❌ Error importing from external database: {e}")
         raise HTTPException(status_code=500, detail=f"Error importing from external database: {str(e)}")
 
-# ORIGINAL records function - PRESERVED WITH FIX
 @app.get("/records/{source_title}")
 async def get_records_by_source(source_title: str):
     try:
@@ -552,7 +570,6 @@ async def get_records_by_source(source_title: str):
         if not records:
             raise HTTPException(status_code=404, detail="No records found for this source title")
 
-        # Convert ObjectIds to strings
         for record in records:
             record["_id"] = str(record["_id"])
 
@@ -577,7 +594,6 @@ async def get_all_source_titles():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching source titles: {e}")
 
-# ADD health endpoint
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
@@ -602,7 +618,6 @@ async def health_check():
     }
     return health_status
 
-# ORIGINAL startup event - PRESERVED EXACTLY
 @app.on_event("startup")
 async def startup_event():
     global mongo_client, db, collection
@@ -619,8 +634,35 @@ async def startup_event():
         db = None
         collection = None
 
-# ORIGINAL main check - PRESERVED EXACTLY
+@app.post("/chatbot")
+async def chatbot_interaction(request: ChatbotRequest):
+    prompt_text = request.prompt.strip()
+    if not prompt_text:
+        raise HTTPException(status_code=400, detail="Prompt cannot be empty.")
+
+    try:
+        # Use GEMINI_API_KEY
+        if not GEMINI_CHAT_KEY:
+            return {"error": "Gemini API key is not set."}
+        
+        genai.configure(api_key=GEMINI_CHAT_KEY)
+        chat_model = genai.GenerativeModel('gemini-2.0-flash-exp')
+
+        gemini_prompt = f"""Act as an intelligent assistant for the JanMatra platform.
+        Respond conversationally and help users understand their public feedback data, generate reports, and suggest improvements.
+        User says: {prompt_text}
+        Respond to it like a chatbot, dont use any bold italic underline or markdown formattings. Keep it concise and relevant.
+        """
+
+        response = chat_model.generate_content(gemini_prompt)
+        answer = response.text.strip() if hasattr(response, 'text') else str(response)
+
+        return {"response": answer}
+
+    except Exception as e:
+        print(f"Gemini chatbot error: {e}")
+        return {"error": str(e)}
+
 if __name__ == "__main__":
     import uvicorn
-    
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
